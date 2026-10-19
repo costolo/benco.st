@@ -24,42 +24,54 @@ node .output/server/index.mjs
 
 ### Deploying to Cloud Run
 
-Production is Google Cloud Run, which terminates TLS itself and injects a `PORT`
-(default 8080) into the container. Nitro's node server honours both `PORT` and
-`HOST`, so the image needs no Cloud Run-specific configuration; the `Dockerfile`
-deliberately bakes in no `PORT` so the injected value cannot be shadowed.
-Locally, and in `docker-compose.yml`, nitro falls back to 3000.
+Production is the Cloud Run service **`portfolio`** in `northamerica-northeast1`
+(project `bencost`), with benco.st attached through Cloud Run's custom-domains
+router. Cloud Run terminates TLS itself and injects a `PORT` — the service's
+container port is **8080**, which is why the Astro image's `ENV PORT=4321` never
+mattered. Nitro's node server honours both `PORT` and `HOST`, so the image needs
+no Cloud Run-specific configuration; the `Dockerfile` deliberately bakes in no
+`PORT` so the injected value cannot be shadowed. Locally, and in
+`docker-compose.yml`, nitro falls back to 3000.
 
-Swap the service onto this app as a new revision behind a traffic split, so the
-domain never moves and rollback is a single command:
+Because the domain is bound to the *service*, swapping apps is a new revision on
+that same service — no DNS or certificate changes, and rollback is one command.
 
 ```bash
-# Note the current revision name first — it is the rollback target.
-gcloud run services describe SERVICE --region REGION
+R=northamerica-northeast1
+IMG=northamerica-northeast1-docker.pkg.dev/bencost/bencost-portfolio/nuxtlio:1.5.0
 
-gcloud builds submit --tag REGION-docker.pkg.dev/PROJECT/REPO/nuxtlio:1.5.0 .
+# 0. Record the revision you are rolling back to, and how traffic is targeted.
+gcloud run services describe portfolio --region $R \
+  --format='value(status.traffic[].revisionName, status.traffic[].percent)'
 
-# --no-traffic with --tag yields a preview URL for the un-promoted revision.
-gcloud run deploy SERVICE --region REGION \
-  --image REGION-docker.pkg.dev/PROJECT/REPO/nuxtlio:1.5.0 \
-  --no-traffic --tag nuxt --port 8080 --memory 1Gi --cpu-boost
+# 1. Pin traffic explicitly. The service ships with latestRevision: true, which
+#    auto-promotes any new revision to 100% — pinning first makes step 3 inert.
+gcloud run services update-traffic portfolio --region $R \
+  --to-revisions portfolio-00006-jmq=100
 
-curl -sS -o /dev/null -w '%{http_code}\n' https://nuxt-SERVICE-HASH.run.app/
+# 2. Build and push. Docker is already credHelper'd for this registry.
+docker build -t "$IMG" . && docker push "$IMG"
 
-gcloud run services update-traffic SERVICE --region REGION \
-  --to-revisions REVISION_nuxt=100
-gcloud run services update-traffic SERVICE --region REGION \
-  --to-revisions OLD_REVISION=100  # rollback
+# 3. New revision, no traffic, with a preview URL.
+gcloud run deploy portfolio --region $R --image "$IMG" \
+  --no-traffic --tag nuxt --port 8080 --cpu-boost
+
+# 4. Smoke-test the printed https://nuxt-portfolio-*.run.app URL, then promote.
+gcloud run services update-traffic portfolio --region $R \
+  --to-revisions NEW_REVISION=100
+
+# Rollback.
+gcloud run services update-traffic portfolio --region $R \
+  --to-revisions portfolio-00006-jmq=100
 ```
 
-Review the `describe` output before deploying: environment variables and
-`--allow-unauthenticated` are service-level settings that carry into the new
-revision, and anything configured for the Astro app should not be inherited
-blindly (that image defaulted to port 4321, so the service's container port may
-not be 8080). `--memory 1Gi` is a deliberate bump over Cloud Run's 512Mi default
-for SSR rendering, and `--cpu-boost` shortens cold starts. Building locally
-works too — this machine is x86_64, so `docker build` produces linux/amd64
-images natively.
+The service currently sets no environment variables, so nothing astro-specific
+carries into the new revision; `roles/run.invoker: allUsers` and
+`--allow-unauthenticated` are service-level and persist. `--cpu-boost` shortens
+cold starts. Memory is 512Mi today, which is enough for SSR — add
+`--memory 1Gi` only if you want headroom, since it roughly doubles per-request
+memory cost. `gcloud builds submit --tag "$IMG" .` works as an alternative to
+step 2; `.gcloudignore` keeps `node_modules` out of that upload.
 
 ## How it maps to the Astro original
 
