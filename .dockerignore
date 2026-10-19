@@ -1,0 +1,17 @@
+.git
+.gitignore
+.nuxt
+.output
+.data
+dist
+node_modules
+logs
+*.log
+.DS_Store
+.fleet
+.idea
+.env
+.env.*
+Dockerfile
+docker-compose.yml
+README.md
