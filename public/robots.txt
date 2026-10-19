@@ -1,0 +1,19 @@
+# AI training and scraping bots are denied site-wide; search engines remain
+# allowed in the global group below so the sitemap/SEO wiring keeps working.
+User-agent: GPTBot
+User-agent: OAI-SearchBot
+User-agent: ChatGPT-User
+User-agent: CCBot
+User-agent: ClaudeBot
+User-agent: Anthropic-AI
+User-agent: Google-Extended
+User-agent: PerplexityBot
+User-agent: Bytespider
+User-agent: Amazonbot
+User-agent: meta-externalagent
+Disallow: /
+
+User-agent: *
+Disallow:
+Host: https://benco.st
+Sitemap: https://benco.st/sitemap-index.xml

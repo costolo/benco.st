@@ -1,0 +1,41 @@
+services:
+  anubis:
+    image: ghcr.io/techarohq/anubis:latest
+    restart: unless-stopped
+    ports:
+      # Public entrypoint. Keep whatever terminates TLS for benco.st in front
+      # of this port; Anubis does not terminate TLS itself.
+      - "8080:8080"
+    environment:
+      TARGET: http://web:3000
+      BIND: ":8080"
+      DIFFICULTY: "4"
+      POLICY_FNAME: /data/cfg/botPolicy.yaml
+      # If Anubis is the true edge (nothing in front of it), set this to ignore
+      # spoofable X-Forwarded-For headers. If a TLS proxy sits in front, leave
+      # it unset and have that proxy send X-Real-IP instead.
+      # USE_REMOTE_ADDRESS: "true"
+      # Only needed if clients connect over plain HTTP end-to-end; the Secure
+      # cookie default is correct while the public face of the site is HTTPS.
+      # COOKIE_SECURE: "false"
+      # COOKIE_SAME_SITE: Lax
+      # Uncomment and set in .env (generate with `openssl rand -hex 32`) to keep
+      # challenge pass-cookies valid across Anubis restarts; auto-generated
+      # when unset, which simply re-challenges visitors after a restart.
+      # ED25519_PRIVATE_KEY_HEX: ${ED25519_PRIVATE_KEY_HEX}
+    volumes:
+      - ./botPolicy.yaml:/data/cfg/botPolicy.yaml:ro
+    depends_on:
+      - web
+    healthcheck:
+      test: ["CMD", "anubis", "--healthcheck"]
+      interval: 5s
+      timeout: 30s
+      retries: 5
+      start_period: 500ms
+  web:
+    build: .
+    restart: unless-stopped
+    expose:
+      # Internal only: the Nuxt app is reachable solely through Anubis.
+      - "3000"

@@ -1,0 +1,139 @@
+## Anubis bot policy for benco.st.
+##
+## A custom POLICY_FNAME replaces the shipped default entirely, so this file
+## reproduces the default ruleset (as of ghcr.io/techarohq/anubis:latest,
+## October 2026) through the same (data)/... imports, then appends DENY rules
+## mirroring the AI/scraping user-agent list declared in public/robots.txt
+## (the robots2policy mapping: blacklisted user-agent + `Disallow: /` => DENY).
+## The GeoIP WEIGH rules from the default file are omitted: they are no-ops
+## without MaxMind databases configured.
+##
+## Rule order is load-bearing: the good-crawler and keep-internet-working
+## allows run before the deny-list so search engines, feed readers and
+## /robots.txt itself are never caught by it.
+
+bots:
+  # Pathological bots to deny
+  - import: (data)/bots/_deny-pathological.yaml
+  - import: (data)/bots/aggressive-brazilian-scrapers.yaml
+  - import: (data)/common/domain-fronting.yaml
+
+  # Aggressively block AI/LLM related bots/agents by default
+  - import: (data)/meta/ai-block-aggressive.yaml
+
+  # Search engine crawlers, feed readers and the Internet Archive
+  - import: (data)/crawlers/_allow-good.yaml
+  # Challenge Firefox AI previews
+  - import: (data)/clients/x-firefox-ai.yaml
+
+  # x.ai has a scraper that is killing gitlab instances
+  - import: (data)/crawlers/xai.yaml
+
+  # Allow common "keeping the internet working" routes (well-known, favicon, robots.txt)
+  - import: (data)/common/keep-internet-working.yaml
+
+  # Mirrors the public/robots.txt deny-list so enforcement matches the
+  # declared crawl policy. Case-insensitive regexes rather than robots2policy's
+  # userAgent.contains so user-agent casing drift cannot slip past.
+  - name: robots-txt-policy-blacklist-gptbot
+    user_agent_regex: (?i:GPTBot)
+    action: DENY
+  - name: robots-txt-policy-blacklist-oai-searchbot
+    user_agent_regex: (?i:OAI-SearchBot)
+    action: DENY
+  - name: robots-txt-policy-blacklist-chatgpt-user
+    user_agent_regex: (?i:ChatGPT-User)
+    action: DENY
+  - name: robots-txt-policy-blacklist-ccbot
+    user_agent_regex: (?i:CCBot)
+    action: DENY
+  - name: robots-txt-policy-blacklist-claudebot
+    user_agent_regex: (?i:ClaudeBot)
+    action: DENY
+  - name: robots-txt-policy-blacklist-anthropic-ai
+    user_agent_regex: (?i:Anthropic-AI)
+    action: DENY
+  - name: robots-txt-policy-blacklist-google-extended
+    user_agent_regex: (?i:Google-Extended)
+    action: DENY
+  - name: robots-txt-policy-blacklist-perplexitybot
+    user_agent_regex: (?i:PerplexityBot)
+    action: DENY
+  - name: robots-txt-policy-blacklist-bytespider
+    user_agent_regex: (?i:Bytespider)
+    action: DENY
+  - name: robots-txt-policy-blacklist-amazonbot
+    user_agent_regex: (?i:Amazonbot)
+    action: DENY
+  - name: robots-txt-policy-blacklist-meta-externalagent
+    user_agent_regex: (?i:meta-externalagent)
+    action: DENY
+
+  # Generic catchall rule: browser-like clients accumulate weight and are
+  # tiered into challenges by the thresholds below.
+  - name: generic-browser
+    user_agent_regex: >-
+      Mozilla|Opera
+    action: WEIGH
+    weight:
+      adjust: 10
+
+dnsbl: false
+
+honeypot:
+  enabled: true
+  implementation: naive
+
+# Lets social/link unfurlers read page metadata without solving a challenge.
+openGraph:
+  enabled: true
+  considerHost: false
+  ttl: 24h
+
+# HTTP 200 for challenges/denials is load-bearing: the most aggressive
+# scrapers stop sending requests once they receive it.
+status_codes:
+  CHALLENGE: 200
+  DENY: 200
+
+store:
+  backend: memory
+  parameters: {}
+
+thresholds:
+  - name: minimal-suspicion
+    expression: weight <= 0
+    action: ALLOW
+  - name: mild-suspicion
+    expression:
+      all:
+        - weight > 0
+        - weight < 10
+    action: CHALLENGE
+    challenge:
+      algorithm: metarefresh
+      difficulty: 1
+  - name: moderate-suspicion
+    expression:
+      all:
+        - weight >= 10
+        - weight < 20
+    action: CHALLENGE
+    challenge:
+      algorithm: fast
+      difficulty: 2
+  - name: mild-proof-of-work
+    expression:
+      all:
+        - weight >= 20
+        - weight < 30
+    action: CHALLENGE
+    challenge:
+      algorithm: fast
+      difficulty: 4
+  - name: extreme-suspicion
+    expression: weight >= 30
+    action: CHALLENGE
+    challenge:
+      algorithm: fast
+      difficulty: 6
