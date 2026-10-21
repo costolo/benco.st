@@ -36,6 +36,16 @@ no Cloud Run-specific configuration; the `Dockerfile` deliberately bakes in no
 Because the domain is bound to the *service*, swapping apps is a new revision on
 that same service — no DNS or certificate changes, and rollback is one command.
 
+`scripts/deploy.sh` (`npm run deploy`) automates the runbook below for the
+single-container Nuxt image: it refuses to run off `main` or on a dirty tree
+(`--allow-dirty` to override), pins traffic to the running revision, builds and
+pushes (`nuxtlio:<version>-<sha>`, local docker with a Cloud Build fallback),
+stages the new revision at 0% behind the `nuxt` tag, smoke-tests the tag URL,
+asks before promoting it to 100%, then restores `--to-latest`. Any failure
+leaves traffic pinned to the previous revision and prints the rollback command.
+`-y` skips the prompt; `--keep-pinned` skips the `--to-latest` restore. The
+manual sequence stays here as the reference for what the script does:
+
 ```bash
 R=northamerica-northeast1
 IMG=northamerica-northeast1-docker.pkg.dev/bencost/bencost-portfolio/nuxtlio:1.5.0
@@ -138,32 +148,81 @@ proof-of-work, so Anubis raises cost and stops JS-less bulk scraping rather
 than acting as a complete wall. First human visits pay a few seconds of
 challenge time, and JS-blocking extensions (e.g. JShelter) fail it.
 
+`DIFFICULTY` in `docker-compose.yml` has no visible effect once `POLICY_FNAME` is
+set. Anubis still echoes `difficulty:4` in its startup log, but the `thresholds`
+block in `botPolicy.yaml` is what maps a rule's weight to a challenge difficulty.
+
 ### Anubis on Cloud Run
 
-Cloud Run runs a single container per service — no compose, no sidecar — so the
-topology above does not deploy there. On Cloud Run the site is protected by the
-`public/robots.txt` deny-list alone unless Anubis is stood up as its own
-service, which takes:
+Cloud Run runs multiple containers per revision, and every container in an
+instance shares one network namespace, so they reach each other over
+`localhost:port`. Only the single container with an exposed port receives
+external traffic. That makes Anubis the ingress container of the *existing*
+`portfolio` service, with Nuxt as a sidecar:
 
-1. A second, public Cloud Run service running `ghcr.io/techarohq/anubis`, bound
-   to the injected `PORT` rather than a hardcoded `:8080`, with `botPolicy.yaml`
-   baked in via `COPY` — Cloud Run has no volumes, so the bind mount has to go
-   into the image.
-2. The Nuxt service made unreachable directly, otherwise scrapers just skip
-   Anubis. `--ingress internal` only accepts traffic from an internal or
-   self-managed load balancer, so this needs a VPC network, a connector, and an
-   internal application load balancer in front of Nuxt.
-3. `TARGET` pointing at Nuxt's internal load balancer hostname, and
-   `USE_REMOTE_ADDRESS` left unset, since Cloud Run supplies `X-Forwarded-For`.
-4. `ED25519_PRIVATE_KEY_HEX` set from a Cloud Run secret. Pass-cookies are
-   signed with this key, and each container generates its own when it is unset,
-   so cookies minted by one instance or revision would be rejected by the next.
-   This is optional in the compose setup and effectively mandatory here.
-5. The benco.st domain mapping moved from the Nuxt service to the Anubis one,
-   with any future proxy in front of Anubis still routing
-   `/.within.website/x/xess/` and `/.within.website/x/cmd/anubis` to it.
+```
+benco.st -> global LB -> Cloud Run service `portfolio`
+                           |- anubis  (ingress, containerPort 8080)
+                           `- nuxt    (sidecar, localhost:3000, no external port)
+```
 
-Other Anubis state is also per-container, so decide whether a single instance is
-acceptable before scaling it. Net: a load balancer, a VPC connector and a second
-service to protect a mostly-static personal site — not worth it until scraping
-is a measured problem rather than an annoyance.
+The domain binds to the service, so this needs no DNS change, no certificate
+work, no VPC, no connector, no internal load balancer and no second service.
+Scrapers also cannot route around Anubis the way a two-service split would
+allow, because a sidecar with no exposed port has no external address to reach.
+`/.within.website/x/xess/` and `/.within.website/x/cmd/anubis` need no special
+routing for the same reason.
+
+Gotchas, verified against Anubis `v1.28.1` and the Cloud Run docs:
+
+- **Anubis does not read `$PORT`.** It binds `:8923` by default and honours only
+  `BIND`, so `BIND=:8080` and `containerPort: 8080` must be set to the same
+  value by hand — nothing derives one from the other.
+- **The Nuxt image needs no change.** `PORT` is injected into the ingress
+  container only, so Nitro falls back to 3000 exactly as it does under compose.
+  Set `PORT=3000` on the sidecar regardless, so the two containers can never
+  contend for 8080.
+- **Anubis must not take traffic before Nuxt is listening.** Anubis binds in
+  milliseconds while Nitro needs a second or two, so the first request to a cold
+  instance would 502. Make `anubis` depend on `nuxt` and give the sidecar a
+  startup probe. Note that the Cloud Run docs claim healthchecks cannot be
+  configured with the gcloud CLI, but `--startup-probe` does exist and accepts
+  `tcpSocket.port`, as does `--depends-on` — so `gcloud run deploy` can express
+  the whole topology without a revision YAML.
+- **`ED25519_PRIVATE_KEY_HEX` becomes mandatory**, sourced from Secret Manager.
+  Pass-cookies are signed with it, and each container generates its own when it
+  is unset, so scaling out or shipping a revision would invalidate every
+  visitor's cookie and re-challenge them.
+- **Leave `USE_REMOTE_ADDRESS` unset.** Cloud Run supplies `X-Forwarded-For`, and
+  Anubis strips private addresses from it by default, which is what you want
+  behind the load balancer.
+- **`botPolicy.yaml` must be baked into the Anubis image.** Cloud Run has no bind
+  mounts, so `COPY` it in a two-line `FROM ghcr.io/techarohq/anubis:v1.28.1`
+  Dockerfile, build with `--platform linux/amd64`, and pin the version tag rather
+  than `:latest`. The policy's `(data)/...` imports resolve against files
+  embedded in that image, so a version bump can break them — boot it once
+  locally to confirm the policy still parses.
+- **Set `REDIRECT_DOMAINS`.** Left unset, Anubis warns at startup that it "will
+  redirect to any domain": an attacker can send a visitor a validation link with
+  a pre-filled challenge solution that redirects them, pass-cookie in hand, to a
+  hostile site. The value is comma-separated hostnames with no scheme, subdomains
+  are not implied, and every hostname the site answers on must be listed —
+  including a staging tag URL while testing, or the post-challenge redirect fails
+  with "Redirect domain not allowed".
+- **Open Graph passthrough comes from the policy file, not an env var.**
+  `botPolicy.yaml` already sets `openGraph.enabled: true`, which is the current
+  mechanism; `OG_PASSTHROUGH` is a legacy alias kept for backwards compatibility
+  whose default was flipped to `false`. So the startup log reporting
+  `og-passthrough:false` does **not** mean link unfurling is broken — don't add
+  the env var to "fix" it.
+
+CPU and memory limits are declared per container, so the instance is sized for
+both (e.g. 500m/256Mi for Anubis alongside 1000m/512Mi for Nuxt). The
+proof-of-work is solved client-side, so verifying it costs Anubis little.
+
+The service ships with `latestRevision: true`, which auto-promotes any new
+revision to 100%, so pin traffic to the running revision before deploying an
+un-promoted one behind a tag URL.
+
+The command-by-command runbook lives in `ANUBIS-IMPLEMENTATION.md`, which is
+gitignored and local-only.

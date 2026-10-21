@@ -1,0 +1,5 @@
+# Anubis with this repo's bot policy baked in, for Cloud Run (no bind mounts).
+# Pin the tag: botPolicy.yaml's `(data)/...` imports resolve against files
+# embedded in this image, so a version bump can break them.
+FROM ghcr.io/techarohq/anubis:v1.28.1
+COPY botPolicy.yaml /data/cfg/botPolicy.yaml

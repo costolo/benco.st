@@ -17,6 +17,11 @@ logs
 .idea
 
 # Local env files
+anubis.env
 .env
 .env.*
 !.env.example
+README.md
+
+# Local-only runbooks
+ANUBIS-IMPLEMENTATION.md

@@ -9,6 +9,11 @@
       </p>
       <p class="mt-4 outfit text-lg md:text-xl lg:text-2xl">
         <NuxtLink to="/cv">view my cv</NuxtLink>
+        <span
+          class="inline-block align-middle rounded-full bg-current h-[0.3em] w-[0.3em] ml-2 mr-2"
+          aria-hidden="true"
+        />
+        <a href="mailto:me@benco.st">email me</a>
       </p>
       <Ocean />
     </Card>

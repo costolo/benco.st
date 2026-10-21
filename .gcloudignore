@@ -14,3 +14,4 @@ logs
 .env.*
 docker-compose.yml
 README.md
+ANUBIS-IMPLEMENTATION.md
