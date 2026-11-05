@@ -1,22 +1,26 @@
 #!/usr/bin/env bash
 #
-# Deploy the current `main` to Cloud Run service `portfolio` (benco.st) and
-# promote it to 100% of live traffic.
+# Deploy the current `main` to Cloud Run service `portfolio` (benco.st) while
+# preserving the Anubis ingress + Nuxt sidecar topology.
+#
+# Only the Nuxt sidecar image changes. The anubis container is regenerated
+# byte-identical from the live service, so the bot-challenge ingress cannot be
+# regressed by this script. This is NOT the old single-container flow: that used
+# `gcloud run deploy`, which silently drops sidecars. This uses
+# `gcloud run services replace`, the only surface that accepts sidecars, startup
+# probes, and container start ordering (see cloudrun.yaml's header).
 #
 # Flow:
-#   1. preflight      branch/tree/auth checks
-#   2. pin            freeze traffic on the revision serving 100% right now
-#   3. build+push     local docker, Cloud Build if the daemon is unreachable
-#   4. stage          new revision at 0% traffic behind a tag URL
-#   5. smoke test     the tag URL must serve the new build before promotion
-#   6. promote        100% of benco.st, then restore --to-latest
+#   1. preflight   branch/tree/auth checks
+#   2. build+push  local docker, Cloud Build if the daemon is unreachable
+#   3. stage       replace with the new nuxt image at 0% traffic (tag `anubis`);
+#                  the old revision stays 100% (tag `nuxt`) for rollback
+#   4. smoke       the `anubis` tag URL must serve the new build before promote
+#   5. promote     100% of benco.st, keeping both tags
+#   6. verify      anubis challenge + nuxt passthrough on the live domain
 #
-# Step 2 is load-bearing: the service ships `latestRevision: true`, which
-# auto-promotes ANY new revision to 100% the moment it is created. Pinning first
-# is what makes step 4 actually inert, so nothing reaches visitors until step 6.
-#
-# This deploys the single-container Nuxt image only. The Anubis sidecar topology
-# in cloudrun.yaml is a separate `gcloud run services replace` flow.
+# `services replace` is atomic: a bad stage replace errors out without touching
+# the running service. Nothing reaches visitors until the promote step.
 
 set -euo pipefail
 
@@ -26,28 +30,34 @@ readonly SERVICE=${SERVICE:-portfolio}
 readonly REGISTRY=${REGION}-docker.pkg.dev/${PROJECT}/bencost-portfolio
 readonly IMAGE_NAME=nuxtlio
 readonly DOMAIN=${DOMAIN:-https://benco.st}
+# Tag the live revision carries (referenced by anubis REDIRECT_DOMAINS) and the
+# tag the previous good revision carries for rollback.
+readonly LIVE_TAG=anubis
+readonly ROLLBACK_TAG=nuxt
+
+# Smoke-test signals. Only `Mozilla*` user-agents hit the Anubis challenge; a
+# plain `curl` UA (and e.g. facebookexternalhit) passes through to the Nuxt app.
+readonly CHALLENGE_MARKER='Making sure you'
+readonly NUXT_MARKER='/_nuxt/'
+readonly BROWSER_UA='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+readonly CURL_UA='curl/8.0'
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$ROOT"
 
-TAG=nuxt
 ALLOW_DIRTY=0
 ASSUME_YES=0
-KEEP_PINNED=0
 
 usage() {
   cat <<USAGE
 Usage: scripts/deploy.sh [options]
 
-Builds the current \`main\` and promotes it to 100% of ${DOMAIN/#https:\/\//} traffic.
+Builds the current \`main\`, stages it behind the Anubis front, and promotes it
+to 100% of ${DOMAIN/#https:\/\//} traffic. Keeps the Anubis ingress + Nuxt
+sidecar topology; only the Nuxt image changes.
 
   -y, --yes           Promote without the interactive confirmation.
       --allow-dirty   Build from a dirty working tree (default: refuse).
-      --tag NAME      Traffic tag for the staged revision (default: $TAG).
-                      The tag URL moves to the new revision, so the old rollback
-                      tag URL keeps resolving but no longer points at the old build.
-      --keep-pinned   Leave traffic pinned to the deployed revision instead of
-                      restoring --to-latest (the service's shipped default).
   -h, --help          Show this help.
 
 Environment overrides: PROJECT, REGION, SERVICE (rarely needed).
@@ -58,9 +68,6 @@ while [[ $# -gt 0 ]]; do
   case $1 in
     -y|--yes)      ASSUME_YES=1 ;;
     --allow-dirty) ALLOW_DIRTY=1 ;;
-    --keep-pinned) KEEP_PINNED=1 ;;
-    --tag)         TAG=${2:?"--tag needs a value"}; shift ;;
-    --tag=*)       TAG=${1#--tag=} ;;
     -h|--help)     usage; exit 0 ;;
     *)             printf 'unknown option: %s\n\n' "$1" >&2; usage >&2; exit 2 ;;
   esac
@@ -80,44 +87,49 @@ step() { printf '\n%s==> %s%s\n' "$BOLD" "$*" "$OFF"; }
 info() { printf '    %s\n' "$*"; }
 ok()   { printf '    %s%s%s\n' "$GREEN" "$*" "$OFF"; }
 warn() { printf '    %s! %s%s\n' "$YELLOW" "$*" "$OFF" >&2; }
-die()  { printf '\n%serror:%s %s\n' "$RED" "$OFF" "$*" >&2; pin_hint; exit 1; }
+die()  { printf '\n%serror:%s %s\n' "$RED" "$OFF" "$*" >&2; rollback_hint; exit 1; }
 
-# Printed on any failure once traffic has been pinned, so the operator is never
-# left guessing whether the old build is still live.
-pin_hint() {
-  [[ -n ${PREV_REV:-} ]] || return 0
+# Printed on any failure once the old revision has been identified, so the
+# operator always knows how to point traffic back.
+rollback_hint() {
+  [[ -n ${OLD_REV:-} ]] || return 0
   cat >&2 <<EOF
 
-    Traffic is pinned to $PREV_REV, so $DOMAIN is still serving the
-    previous build. Nothing was promoted. Re-run after fixing, or re-pin:
+    $OLD_REV is still the rollback target. Nothing was promoted to it unless a
+    promote step above already ran. To pin traffic back:
 
       gcloud run services update-traffic $SERVICE \\
-        --region=$REGION --project=$PROJECT --to-revisions=$PREV_REV=100
+        --region=$REGION --project=$PROJECT \\
+        --to-revisions=$OLD_REV=100
+
 EOF
 }
 
-# Service reads are frequent enough to be worth a helper; --format values are
+# Service reads are frequent enough to warrant a helper; --format values are
 # verified against the live service, not assumed.
 svc() {
   gcloud run services describe "$SERVICE" \
     --region="$REGION" --project="$PROJECT" --format="$1"
 }
 
-# The revision currently taking traffic. Slicing the traffic list inside
-# --format (status.traffic[percent=100].revisionName) silently returns empty on
-# this SDK, so flatten to csv and filter with awk instead.
+# The revision currently taking 100%. Slicing the traffic list inside --format
+# silently returns empty on this SDK, so emit one record per list item
+# (--flatten) and filter with awk. Without --flatten, gcloud joins a multi-entry
+# list's repeated fields with ';' and the comma-split misaligns.
 serving_revision() {
-  svc 'csv[no-heading](status.traffic.percent,status.traffic.revisionName)' \
+  gcloud run services describe "$SERVICE" \
+    --region="$REGION" --project="$PROJECT" \
+    --flatten=status.traffic \
+    --format='csv[no-heading](status.traffic.percent,status.traffic.revisionName)' \
     | awk -F, '$1 + 0 > 0 { print $2; exit }'
 }
 
 tag_url() {
-  svc 'csv[no-heading](status.traffic.tag,status.traffic.url)' \
+  gcloud run services describe "$SERVICE" \
+    --region="$REGION" --project="$PROJECT" \
+    --flatten=status.traffic \
+    --format='csv[no-heading](status.traffic.tag,status.traffic.url)' \
     | awk -F, -v t="$1" '$1 == t { print $2; exit }'
-}
-
-http_code() {
-  curl -sS -o /dev/null -w '%{http_code}' --max-time "${2:-30}" "$1" || true
 }
 
 confirm() {
@@ -129,23 +141,39 @@ confirm() {
   [[ $ans == [yY]* ]]
 }
 
+# url, what, ua, needle -- the needle must appear in the (200) body.
+smoke() {
+  local url=$1 what=$2 ua=$3 needle=$4 attempt body
+  for attempt in 1 2 3 4 5; do
+    body=$(curl -fsS --max-time 30 -A "$ua" "$url" 2>/dev/null || true)
+    if [[ $body == *"$needle"* ]]; then
+      ok "$what"
+      return 0
+    fi
+    [[ $attempt == 5 ]] || { info "retrying $what (attempt $attempt)"; sleep 6; }
+  done
+  return 1
+}
+
 # ------------------------------------------------------------------- preflight
 
-PREV_REV=
+OLD_REV=
 NEW_REV=
+SPEC_TMP=
+trap '[[ -n $SPEC_TMP ]] && rm -f "$SPEC_TMP"' EXIT
 
 on_error() {
   local exit_code=$?
   trap - ERR
   printf '\n%sdeploy failed%s (exit %s)\n' "$RED" "$OFF" "$exit_code" >&2
-  pin_hint
+  rollback_hint
   exit "$exit_code"
 }
 trap on_error ERR
 
 step "Preflight"
 
-for cmd in gcloud git curl awk; do
+for cmd in gcloud git curl awk sed; do
   command -v "$cmd" >/dev/null 2>&1 || die "$cmd not found on PATH"
 done
 
@@ -174,29 +202,13 @@ fi
 
 VERSION=$(grep -m1 '"version"' package.json | cut -d'"' -f4)
 [[ -n $VERSION ]] || die "could not read version from package.json"
-IMAGE=${REGISTRY}/${IMAGE_NAME}:${VERSION}-${SHA}
-info "image: $IMAGE"
-
-# ------------------------------------------------------------------------ pin
-
-step "Pin traffic to the running revision"
-
-PREV_REV=$(serving_revision)
-if [[ -z $PREV_REV ]]; then
-  warn "no revision with a traffic percent; falling back to latestReadyRevisionName"
-  PREV_REV=$(svc 'value(status.latestReadyRevisionName)')
-fi
-[[ -n $PREV_REV ]] || die "could not determine the revision currently serving traffic"
-info "serving 100% now: $PREV_REV"
-
-gcloud run services update-traffic "$SERVICE" \
-  --region="$REGION" --project="$PROJECT" \
-  --to-revisions="${PREV_REV}=100" --quiet > /dev/null
-ok "pinned to $PREV_REV (latestRevision auto-promote is now off)"
 
 # ---------------------------------------------------------------------- build
 
-step "Build and push"
+step "Build and push the Nuxt sidecar image"
+
+IMAGE=${REGISTRY}/${IMAGE_NAME}:${VERSION}-${SHA}
+info "image: $IMAGE"
 
 build_and_push() {
   docker build --platform linux/amd64 -t "$IMAGE" . && docker push "$IMAGE"
@@ -224,20 +236,64 @@ ok "pushed $IMAGE"
 
 # ---------------------------------------------------------------------- stage
 
-step "Create the new revision (0% traffic, tag '$TAG')"
+step "Stage the new Nuxt revision at 0% traffic (tag '$LIVE_TAG')"
 
-gcloud run deploy "$SERVICE" \
-  --region="$REGION" --project="$PROJECT" \
-  --image="$IMAGE" \
-  --port=8080 \
-  --cpu-boost \
-  --no-traffic --tag="$TAG"
+OLD_REV=$(serving_revision)
+if [[ -z $OLD_REV ]]; then
+  OLD_REV=$(svc 'value(status.latestReadyRevisionName)')
+fi
+[[ -n $OLD_REV ]] || die "could not determine the revision currently serving traffic"
 
-NEW_REV=$(svc 'value(status.latestCreatedRevisionName)')
-[[ -n $NEW_REV ]] || die "could not read the new revision name"
-[[ $NEW_REV != "$PREV_REV" ]] \
-  || die "latestCreatedRevisionName is still $PREV_REV; the deploy did not create a revision"
-ok "created $NEW_REV"
+TEMPLATE_NAME=$(svc 'value(spec.template.metadata.name)')
+[[ -n $TEMPLATE_NAME ]] || die "could not read the live template revision name"
+
+# A name reused by any revision is rejected, so derive a fresh one while keeping
+# it greppable: <commit>-<unixtime>.
+NEW_REV="portfolio-anubis-${SHA}-$(date +%s)"
+info "old revision (rollback): $OLD_REV"
+info "new revision:            $NEW_REV"
+
+SPEC_TMP=$(mktemp "${TMPDIR:-/tmp}/portfolio-replace.XXXXXX.yaml")
+
+# Regenerate the replace spec from the LIVE export so the anubis container (and
+# the custom-domain + secret + startup-ordering wiring) cannot drift from
+# production. Strip the read-only/system-managed fields (the two output
+# annotations plus the client-* informational annotations and the
+# startupProbeType label -- its "Default" value is wrong for this service, per
+# cloudrun.yaml), swap the nuxt image tag, bump the template name, and rewrite
+# traffic so the old revision keeps 100% while the new revision lands behind the
+# `anubis` tag at 0%.
+gcloud run services describe "$SERVICE" \
+  --region="$REGION" --project="$PROJECT" --format=export \
+  | grep -v \
+      -e 'run.googleapis.com/urls' \
+      -e 'run.googleapis.com/ingress-status' \
+      -e 'run.googleapis.com/client-name' \
+      -e 'run.googleapis.com/client-version' \
+      -e 'run.googleapis.com/startupProbeType' \
+      -e '^      labels:$' \
+  | sed -e "s|^        image: .*/nuxtlio:.*|        image: ${IMAGE}|" \
+        -e "s|^      name: ${TEMPLATE_NAME}$|      name: ${NEW_REV}|" \
+  | awk -v old="$OLD_REV" -v new="$NEW_REV" \
+        -v live="$LIVE_TAG" -v rollback="$ROLLBACK_TAG" '
+      /^  traffic:/ {
+        print "  traffic:"
+        print "  - revisionName: " old
+        print "    percent: 100"
+        print "    tag: " rollback
+        print "  - revisionName: " new
+        print "    tag: " live
+        exit
+      }
+      { print }
+    ' > "$SPEC_TMP"
+
+# Surface the only deliberate image change, so a wrong swap is obvious.
+grep -n "nuxtlio:" "$SPEC_TMP" | sed 's/^/    /'
+
+gcloud run services replace "$SPEC_TMP" \
+  --region="$REGION" --project="$PROJECT" --quiet
+ok "staged $NEW_REV at 0% (tag '$LIVE_TAG'); $OLD_REV still at 100%"
 
 info "waiting for $NEW_REV to become ready"
 for _ in $(seq 1 60); do
@@ -248,52 +304,20 @@ done
   || die "$NEW_REV never became ready; check: gcloud run revisions describe $NEW_REV --region=$REGION"
 ok "$NEW_REV is ready"
 
-# `gcloud run deploy` read-modify-writes the service, so cpu/memory carry over
-# from the previous revision. Surface them anyway: a silent downgrade only shows
-# up later as an OOM kill under load.
-REV_SPEC=$(gcloud run revisions describe "$NEW_REV" \
-  --region="$REGION" --project="$PROJECT" \
-  --format='value(spec.containers[0].image,spec.containers[0].resources.limits.cpu,spec.containers[0].resources.limits.memory)' \
-  | tr '\t' ' ')
-info "running: $REV_SPEC"
-[[ $REV_SPEC == ${REGISTRY}/${IMAGE_NAME}* ]] \
-  || die "$NEW_REV is not running $IMAGE_NAME from $REGISTRY"
-
 # ----------------------------------------------------------------- smoke test
 
 step "Smoke test the staged revision"
 
-STAGE_URL=$(tag_url "$TAG")
-[[ -n $STAGE_URL ]] || die "no tag URL for '$TAG' on the service"
+STAGE_URL=$(tag_url "$LIVE_TAG")
+[[ -n $STAGE_URL ]] || die "no tag URL for '$LIVE_TAG' on the service"
 info "$STAGE_URL -> $NEW_REV"
 
-smoke() { # url, description, [substring]
-  local url=$1 what=$2 needle=${3:-} attempt code body
-  for attempt in 1 2 3; do
-    if [[ -n $needle ]]; then
-      body=$(curl -fsS --max-time 30 "$url" 2>/dev/null || true)
-      if [[ $body == *"$needle"* ]]; then
-        ok "$what"
-        return 0
-      fi
-    else
-      code=$(http_code "$url")
-      if [[ $code == 200 ]]; then
-        ok "$what (200)"
-        return 0
-      fi
-    fi
-    [[ $attempt == 3 ]] || { info "retrying $what (attempt $attempt)"; sleep 5; }
-  done
-  return 1
-}
-
-# `/_nuxt/` asset paths prove the response came from a Nuxt build rather than a
-# cached or error page.
-smoke "$STAGE_URL/" "GET /  renders the Nuxt app" '/_nuxt/' \
-  || die "staged revision failed GET / at $STAGE_URL"
-smoke "$STAGE_URL/sitemap.xml" "GET /sitemap.xml" \
-  || die "staged revision failed /sitemap.xml at $STAGE_URL"
+# Anubis must still front the new revision (browser UA gets challenged), and the
+# new Nuxt image must still serve (curl UA passes through to a real Nuxt page).
+smoke "$STAGE_URL/" "anubis challenge on staged revision" "$BROWSER_UA" "$CHALLENGE_MARKER" \
+  || die "anubis is not fronting the staged revision at $STAGE_URL"
+smoke "$STAGE_URL/" "nuxt passthrough on staged revision" "$CURL_UA" "$NUXT_MARKER" \
+  || die "staged revision did not serve the Nuxt build at $STAGE_URL"
 
 # --------------------------------------------------------------------- promote
 
@@ -301,41 +325,33 @@ step "Promote"
 
 cat <<EOF
 
-    $SERVICE: $PREV_REV (100%)  ->  $NEW_REV (100%)
+    $SERVICE: $OLD_REV (100%)  ->  $NEW_REV (100%)
     image:    $IMAGE
     live at:  $DOMAIN
 
 EOF
 
 confirm "Promote $NEW_REV to 100% of $DOMAIN?" \
-  || die "aborted before promotion; $PREV_REV is still serving 100%"
+  || die "aborted before promotion; $OLD_REV is still serving 100%"
 
+# Flip the percentages, then re-assert the tags (update-traffic reconstructs the
+# traffic list on each call, so the two flags are applied in two steps).
 gcloud run services update-traffic "$SERVICE" \
   --region="$REGION" --project="$PROJECT" \
-  --to-revisions="${NEW_REV}=100" --quiet > /dev/null
-ok "$NEW_REV is taking 100%"
+  --to-revisions="${NEW_REV}=100,${OLD_REV}=0" --quiet > /dev/null
+gcloud run services update-traffic "$SERVICE" \
+  --region="$REGION" --project="$PROJECT" \
+  --set-tags="${LIVE_TAG}=${NEW_REV},${ROLLBACK_TAG}=${OLD_REV}" --quiet > /dev/null
+ok "$NEW_REV is taking 100% (tag '$LIVE_TAG'); $OLD_REV is the '$ROLLBACK_TAG' rollback"
 
-if [[ $KEEP_PINNED == 1 ]]; then
-  info "leaving traffic pinned to $NEW_REV (--keep-pinned)"
-else
-  gcloud run services update-traffic "$SERVICE" \
-    --region="$REGION" --project="$PROJECT" --to-latest --quiet > /dev/null
-  ok "restored latestRevision: true (the service's shipped default)"
-fi
+# ------------------------------------------------------------------ verify live
 
 step "Verify $DOMAIN"
 
-for path in / /sitemap.xml; do
-  for attempt in 1 2 3; do
-    code=$(http_code "${DOMAIN}${path}")
-    [[ $code == 200 ]] && { ok "GET ${path} 200"; break; }
-    if [[ $attempt == 3 ]]; then
-      warn "GET ${path} returned ${code:-000} after 3 tries; check the LB/domain binding"
-    else
-      sleep 5
-    fi
-  done
-done
+smoke "$DOMAIN/" "anubis challenge on $DOMAIN" "$BROWSER_UA" "$CHALLENGE_MARKER" \
+  || warn "anubis challenge not observed on $DOMAIN; check the domain binding"
+smoke "$DOMAIN/" "nuxt passthrough on $DOMAIN" "$CURL_UA" "$NUXT_MARKER" \
+  || warn "nuxt passthrough not observed on $DOMAIN; check the domain binding"
 
 trap - ERR
 cat <<EOF
@@ -345,6 +361,6 @@ ${BOLD}Deployed${OFF} $DOMAIN  ->  $NEW_REV  ($IMAGE)
   Roll back with:
     gcloud run services update-traffic $SERVICE \\
       --region=$REGION --project=$PROJECT \\
-      --to-revisions=$PREV_REV=100
+      --to-revisions=$OLD_REV=100
 
 EOF
