@@ -66,11 +66,11 @@ export const cv: CvData = {
   skills: [
     {
       title: 'Languages',
-      items: ['ES2024', 'Typescript', 'HTML', 'CSS/SCSS', 'Python', 'Ruby', 'PHP', 'SQL'],
+      items: ['JavaScript', 'Typescript', 'HTML', 'CSS', 'SCSS', 'Python', 'Ruby', 'PHP', 'SQL', 'C#'],
     },
     {
       title: 'Frameworks',
-      items: ['React', 'Node', 'Express', 'NestJS', 'Flask', 'Rails', 'Laravel', 'Astro JS', 'Storybook'],
+      items: ['React', 'Vue', 'Node', 'Express', 'Flask', 'Rails', 'Laravel', 'NextJS', 'Storybook'],
     },
     {
       title: 'Tools',
@@ -80,6 +80,7 @@ export const cv: CvData = {
         'Docker',
         'PostgreSQL',
         'Google Cloud Platform',
+        'Claude Code',
         'Sentry',
         'New Relic',
         'Datadog',
@@ -109,6 +110,21 @@ export const cv: CvData = {
   ],
 
   experience: [
+    {
+      role: 'Software Engineer',
+      company: 'Neptune Flood',
+      location: 'Remote',
+      start: '05/2025',
+      end: '09/2026',
+      summary: 'Neptune Flood is America\'s largest private flood insurance provider.',
+      highlights: [
+        'Increased user engagement on our direct-to-consumer application by 80% by overhauling the UI experience, with LaunchDarkly integration for A/B testing across the funnel.',
+        'Translated customer feedback into redesigned profile pages for individual user management as well as agency management.',
+        'Delivered the frontend of an authentication revamp migrating customers from shared one-to-many accounts to individual one-to-one accounts, including new registration, sign-in, and account management flows, all backed by unit and integration tests.',
+        'Built state-gated compliance disclosure flows for California and Maine that intercept quote and bind, keeping a single funnel codebase compliant across differing legal jurisdictions.',
+        'Shipped the UI for Indemnity Earthquake, a full-coverage earthquake product, from quote and disclosure through bind and policy servicing.'
+      ]
+    },
     {
       role: 'Software Engineer',
       company: 'Aperture Education',
