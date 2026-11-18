@@ -45,4 +45,15 @@ export default defineNuxtConfig({
   site: {
     url: 'https://benco.st',
   },
+
+  routeRules: {
+    // The Godot game lives in the public GCS bucket, not in public/; keep the
+    // old routes working for anyone with a direct link.
+    '/games/trawler': {
+      redirect: 'https://storage.googleapis.com/bencost-games/trawler/index.html',
+    },
+    '/games/trawler/': {
+      redirect: 'https://storage.googleapis.com/bencost-games/trawler/index.html',
+    },
+  },
 })

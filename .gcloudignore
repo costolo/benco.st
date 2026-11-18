@@ -12,6 +12,7 @@ logs
 .idea
 .env
 .env.*
+games
 docker-compose.yml
 README.md
 ANUBIS-IMPLEMENTATION.md

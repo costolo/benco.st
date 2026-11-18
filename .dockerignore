@@ -12,6 +12,7 @@ logs
 .idea
 .env
 .env.*
+games
 Dockerfile
 docker-compose.yml
 README.md

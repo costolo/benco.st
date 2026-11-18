@@ -14,7 +14,7 @@
         <a href="mailto:me@benco.st">email me</a>
         <span class="inline-block align-middle rounded-full bg-current h-[0.3em] w-[0.3em] ml-2 mr-2"
           aria-hidden="true" />
-        <a href="/games/trawler">trawl the seas</a>
+        <a href="https://storage.googleapis.com/bencost-games/trawler/index.html">trawl the seas</a>
       </p>
       <Ocean />
     </Card>
